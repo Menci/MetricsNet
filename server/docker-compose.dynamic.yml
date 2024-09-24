@@ -1,0 +1,98 @@
+<?php
+require_once __DIR__ . '/configurator/include.php';
+// ?>
+
+<?php function template($config) { ?>
+
+name: ${PROJECT_PREFIX}-dyn
+
+services:
+<?php foreach ($config->stores as $store => $storeConfig) { ?>
+  thanos-store-<?= $store ?>:
+    image: quay.io/thanos/thanos:v0.36.1
+    user: root
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2048M
+    volumes:
+      - thanos-cache:/thanos-cache
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    command:
+      - store
+      - --grpc-address=0.0.0.0:10901
+      - --http-address=127.0.0.1:10902
+      - --cache-index-header
+      - --data-dir="/thanos-cache/<?= $store ?>"
+      - |
+        --objstore.config=type: S3
+        config: 
+          bucket: "<?= $storeConfig->bucket ?>"
+          access_key: ${MINIO_ROOT_USER}
+          secret_key: ${MINIO_ROOT_PASSWORD}
+          endpoint: minio:9000
+          insecure: true
+<?php } ?>
+
+  thanos-query-remote:
+    image: quay.io/thanos/thanos:v0.36.1
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4096M
+    environment:
+      # Access Tailnet through the forwarded HTTP proxy
+      HTTP_PROXY: http://forwarder:8080
+      HTTPS_PROXY: http://forwarder:8080
+    command:
+      - query
+      - --grpc-address=0.0.0.0:10901
+      - --http-address=127.0.0.1:10902
+<?php foreach ($config->remotes as $remote) { ?>
+      - --endpoint=passthrough:<?= $remote ?>:10901
+<?php } ?>
+
+  thanos-query:
+    image: quay.io/thanos/thanos:v0.36.1
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4096M
+    command:
+      - query
+      - --grpc-address=127.0.0.1:10901
+      - --http-address=0.0.0.0:10902
+<?php foreach (array_keys($config->stores) as $store) { ?>
+      - --endpoint=passthrough:thanos-store-<?= $store ?>:10901
+<?php } ?>
+      - --endpoint=passthrough:thanos-query-remote:10901
+
+  traefik:
+    image: docker.io/library/traefik:v3.1.2
+    restart: always
+    volumes:
+      - shared-run:/srun
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.file.filename=<?= $config->traefik ?>
+
+networks:
+  default:
+    external: true
+    name: ${PROJECT_PREFIX}_default
+
+volumes:
+  shared-run:
+    external: true
+    name: ${PROJECT_PREFIX}_shared-run
+  thanos-cache:
+
+<?php } ?>

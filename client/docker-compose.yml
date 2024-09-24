@@ -1,0 +1,107 @@
+services:
+  initialize:
+    image: docker.io/library/busybox:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # The initialize container empties the shared-run directory each time.
+        rm -rf /srun/*
+    volumes:
+      - shared-run:/srun
+
+  prometheus:
+    image: docker.io/prom/prometheus:v2.54.1
+    network_mode: host
+    user: root
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    configs:
+      - prometheus.yml
+    volumes:
+      - shared-run:/srun
+      - prometheus-tsdb:/prometheus-tsdb
+    command:
+      - --config.file=/prometheus.yml
+      - --storage.tsdb.path=/prometheus-tsdb
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+      - --storage.tsdb.max-block-duration=${PROMETHEUS_MAX_BLOCK_DURATION:-2h}
+      - --storage.tsdb.min-block-duration=${PROMETHEUS_MIN_BLOCK_DURATION:-2h}
+      - --web.enable-lifecycle
+      - --web.listen-address=${PROMETHEUS_LISTEN:-localhost:9090}
+      - --log.level=debug
+
+  tailscale:
+    image: ghcr.io/menci/tsukasa:v1.0
+    network_mode: host
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - shared-run:/srun
+    command:
+      - --ts-hostname=${TAILSCALE_HOSTNAME}
+      - --ts-state-dir=/var/lib/tailscale
+      - minio-server,listen=unix:/srun/minio.sock,connect=tailscale://${MINIO_SERVER}
+      - thanos-sidecar,listen=tailscale://0.0.0.0:10901,connect=unix:/srun/thanos.sock
+      # Forward Prometheus web port of the host for the containers.
+      - prometheus-web,listen=unix:/srun/prometheus.sock,connect=tcp://${PROMETHEUS_LISTEN:-localhost:9090}
+
+  forwarder:
+    image: ghcr.io/menci/tsukasa:v1.0
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    volumes:
+      - shared-run:/srun
+    command:
+      - minio-server,listen=tcp://0.0.0.0:9000,connect=unix:/srun/minio.sock
+      - prometheus-web,listen=tcp://0.0.0.0:9090,connect=unix:/srun/prometheus.sock
+      - thanos-sidecar,listen=unix:/srun/thanos.sock,connect=tcp://thanos:10901
+
+  thanos:
+    image: quay.io/thanos/thanos:v0.36.1
+    user: root
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    depends_on:
+      forwarder:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    volumes:
+      - prometheus-tsdb:/prometheus-tsdb
+    command:
+      - sidecar
+      - --min-time=-3h
+      - --grpc-address=0.0.0.0:10901
+      - --http-address=127.0.0.1:10902
+      - --prometheus.url=http://forwarder:9090
+      - --tsdb.path=/prometheus-tsdb
+      - |
+        --objstore.config=type: S3
+        config:
+          bucket: thanos-${TAILSCALE_HOSTNAME}
+          access_key: ${MINIO_ACCESS_KEY}
+          secret_key: ${MINIO_SECRET_KEY}
+          endpoint: forwarder:9000
+          insecure: true
+
+# Remember to use `docker compose up --force-recreate`.
+configs:
+  prometheus.yml:
+    file: ${PROMETHEUS_CONFIG:-./prometheus.yml}
+
+volumes:
+  tailscale-state:
+  shared-run:
+  prometheus-tsdb:

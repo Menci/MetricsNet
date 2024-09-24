@@ -1,0 +1,147 @@
+name: ${PROJECT_PREFIX}
+
+services:
+  initialize:
+    image: docker.io/library/busybox:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # The initialize container empties the shared-run directory each time.
+        rm -rf /srun/*
+    volumes:
+      - shared-run:/srun
+
+  tailscale:
+    image: ghcr.io/menci/tsukasa:v1.0
+    network_mode: host
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - shared-run:/srun
+    command:
+      - --timeout=10s
+      - --ts-hostname=${TAILSCALE_HOSTNAME}
+      - --ts-state-dir=/var/lib/tailscale
+      - --ts-listen-http=unix:/srun/tailscale-http.sock
+      # MinIO Server (S3) endpoint
+      - minio-server-host,listen=tcp://${MINIO_LISTEN_HOST},connect=unix:/srun/minio.sock
+      - minio-server-tailscale,listen=tailscale://0.0.0.0:${MINIO_LISTEN_TAILSCALE},connect=unix:/srun/minio.sock
+      # MinIO Web Console endpoint
+      - minio-console-host,listen=tcp://${MINIO_CONSOLE_LISTEN_HOST},connect=unix:/srun/minio-console.sock
+      - minio-console-tailscale,listen=tailscale://0.0.0.0:${MINIO_CONSOLE_LISTEN_TAILSCALE},connect=unix:/srun/minio-console.sock
+      # HTTP (PromQL) query endpoint
+      - http-query-host,listen=tcp://${QUERY_LISTEN_HOST},connect=unix:/srun/http-query.sock
+      - http-query-tailscale,listen=tailscale://0.0.0.0:${QUERY_LISTEN_TAILSCALE},connect=unix:/srun/http-query.sock
+
+  forwarder:
+    image: ghcr.io/menci/tsukasa:v1.0
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      tailscale:
+        condition: service_started
+    volumes:
+      - shared-run:/srun
+    command:
+      - tailscale-http,listen=tcp://0.0.0.0:8080,connect=unix:/srun/tailscale-http.sock
+      - minio-server,listen=unix:/srun/minio.sock,connect=tcp://minio:9000
+      - minio-console,listen=unix:/srun/minio-console.sock,connect=tcp://minio:9001
+      - http-query,listen=unix:/srun/http-query.sock,connect=tcp://traefik:80
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-08-29T01-40-52Z
+    restart: always
+    depends_on:
+      forwarder:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Access Tailnet through the forwarded HTTP proxy
+      HTTP_PROXY: http://forwarder:8080
+      HTTPS_PROXY: http://forwarder:8080
+    volumes:
+      - ${MINIO_DATA_DIR}:/data
+    command:
+      - server
+      - /data
+      - --console-address
+      - :9001
+
+
+  minio-watcher:
+    image: quay.io/minio/mc:RELEASE.2024-08-26T10-49-58Z
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    entrypoint: /bin/bash
+    init: true
+    environment:
+      MINIO_HOST: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      BUCKET_SYNCED_CONFIG: ${BUCKET_SYNCED_CONFIG}
+      FIFO_WATCHER: /srun/minio-watcher.fifo
+    volumes:
+      - shared-run:/srun
+    command:
+      - -c
+      - |
+        set -e
+        POLL_INTERVAL=10
+        mc alias set minio "$$MINIO_HOST" "$$MINIO_ACCESS_KEY" "$$MINIO_SECRET_KEY"
+        mkfifo -- "$$FIFO_WATCHER"
+        function write_to_fifo() {
+          local EVENT="$$1"
+          local DATA="$$2"
+          if [[ $$DATA == "" ]]; then
+            return
+          fi
+          (echo "$$EVENT"; echo "$$DATA") > "$$FIFO_WATCHER" &
+          wait $!
+        }
+        function poll() {
+          while true; do
+            write_to_fifo bucket "$$(mc ls --json minio || true)"
+            if [[ "$$BUCKET_SYNCED_CONFIG" != "" ]]; then
+              write_to_fifo synced_config "$$(mc ls --json minio/"$$BUCKET_SYNCED_CONFIG" || true)"
+            fi
+            sleep $$POLL_INTERVAL
+          done
+        }
+        poll
+
+  configurator:
+    image: docker.io/library/php:8.2-cli
+    restart: always
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      minio-watcher:
+        condition: service_started
+    init: true
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      FIFO_WATCHER: /srun/minio-watcher.fifo
+      FIFO_OUTPUT_DYNAMIC_CONFIG: /output-dynamic-config.fifo
+      BUCKET_EXTRA_STORE_LIST: ${BUCKET_EXTRA_STORE_LIST}
+    volumes:
+      - shared-run:/srun
+      - ./docker-compose.dynamic.yml:/app/index.php
+      - ./configurator:/app/configurator
+      - ${FIFO_OUTPUT_DYNAMIC_CONFIG}:/output-dynamic-config.fifo
+    command: php /app/index.php
+
+volumes:
+  tailscale-state:
+  shared-run:
+  traefik-config:

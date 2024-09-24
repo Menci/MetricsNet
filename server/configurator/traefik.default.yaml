@@ -1,0 +1,11 @@
+http:
+  routers:
+    thanos-http:
+      rule: PathPrefix(`/`)
+      entrypoints: [web]
+      service: thanos-http
+  services:
+    thanos-http:
+      loadBalancer:
+        servers:
+        - url: http://thanos-query:10902
