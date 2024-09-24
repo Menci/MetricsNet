@@ -44,6 +44,7 @@ services:
       - tailscale-state:/var/lib/tailscale
       - shared-run:/srun
     command:
+      - --timeout=10s
       - --ts-hostname=${TAILSCALE_HOSTNAME}
       - --ts-state-dir=/var/lib/tailscale
       - minio-server,listen=unix:/srun/minio.sock,connect=tailscale://${MINIO_SERVER}
@@ -60,6 +61,7 @@ services:
     volumes:
       - shared-run:/srun
     command:
+      - --timeout=10s
       - minio-server,listen=tcp://0.0.0.0:9000,connect=unix:/srun/minio.sock
       - prometheus-web,listen=tcp://0.0.0.0:9090,connect=unix:/srun/prometheus.sock
       - thanos-sidecar,listen=unix:/srun/thanos.sock,connect=tcp://thanos:10901

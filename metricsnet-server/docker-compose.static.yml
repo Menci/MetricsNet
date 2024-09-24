@@ -48,6 +48,7 @@ services:
     volumes:
       - shared-run:/srun
     command:
+      - --timeout=10s
       - tailscale-http,listen=tcp://0.0.0.0:8080,connect=unix:/srun/tailscale-http.sock
       - minio-server,listen=unix:/srun/minio.sock,connect=tcp://minio:9000
       - minio-console,listen=unix:/srun/minio-console.sock,connect=tcp://minio:9001
